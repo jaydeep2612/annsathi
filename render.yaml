@@ -1,0 +1,39 @@
+services:
+  - type: web
+    name: rset-saas-api
+    runtime: docker
+    repo: https://github.com/jaydeep2612/rset_SaaS
+    branch: main
+    autoDeploy: true
+    plan: free
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: APP_DEBUG
+        value: false
+      - key: APP_URL
+        value: https://rset-saas-api.onrender.com
+      - key: DB_CONNECTION
+        value: pgsql
+      - key: DB_HOST
+        fromDatabase:
+          name: rset-saas-db
+          property: host
+      - key: DB_DATABASE
+        fromDatabase:
+          name: rset-saas-db
+          property: database
+      - key: DB_USERNAME
+        fromDatabase:
+          name: rset-saas-db
+          property: user
+      - key: DB_PASSWORD
+        fromDatabase:
+          name: rset-saas-db
+          property: password
+
+databases:
+  - name: rset-saas-db
+    databaseName: rset_saas
+    user: rset_user
+    plan: free

@@ -1,0 +1,313 @@
+<?php
+
+namespace App\Filament\Resources;
+
+use App\Filament\Resources\InvoiceResource\Pages;
+use App\Models\Invoice;
+use Filament\Forms\Components\DatePicker;
+use Filament\Forms\Components\TextInput;
+use Filament\Resources\Resource;
+use Filament\Tables;
+use Filament\Tables\Table;
+use Illuminate\Database\Eloquent\Builder;
+use Filament\Tables\Filters\Filter;
+use Barryvdh\DomPDF\Facade\Pdf;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Str;
+use ZipArchive;
+
+class InvoiceResource extends Resource
+{
+    protected static ?string $model = Invoice::class;
+    protected static ?string $navigationIcon = 'heroicon-o-document-currency-rupee';
+    protected static ?string $navigationGroup = 'Financials';
+    protected static ?string $navigationLabel = 'Tax Invoices';
+
+    public static function getEloquentQuery(): Builder
+    {
+        $user = auth()->user();
+        return parent::getEloquentQuery()->where('restaurant_id', $user->restaurant_id);
+    }
+
+     public static function canAccess(): bool
+    {
+        return auth()->check()
+            && auth()->user()->restaurant_id
+            && in_array(auth()->user()->role->name ?? null, ['manager', 'restaurant_admin']);
+    }
+    // 🔒 STRICTLY IMMUTABLE RESOURCE
+    public static function canCreate(): bool { return false; }
+    public static function canEdit(\Illuminate\Database\Eloquent\Model $record): bool { return false; }
+    public static function canDelete(\Illuminate\Database\Eloquent\Model $record): bool { return false; }
+
+    public static function table(Table $table): Table
+    {
+        return $table
+            ->columns([
+                Tables\Columns\TextColumn::make('invoice_number')
+                    ->label('Invoice #')
+                    ->searchable()
+                    ->sortable()
+                    ->weight('bold')
+                    ->color('primary'),
+                    
+                // 🌟 NAYA: Added Bill Number column to Table
+                Tables\Columns\TextColumn::make('bill_number')
+                    ->label('Bill #')
+                    ->searchable()
+                    ->sortable()
+                    ->color('gray'),
+
+                Tables\Columns\TextColumn::make('invoice_date')
+                    ->date('d M Y')
+                    ->sortable(),
+                Tables\Columns\TextColumn::make('customer_name')
+                    ->searchable(),
+                Tables\Columns\TextColumn::make('grand_total')
+                    ->money('INR') // Update to your locale if needed
+                    ->sortable()
+                    ->weight('bold'),
+            ])
+            ->defaultSort('invoice_sequence', 'desc')
+            ->filters([
+                // 1. By Date
+                Filter::make('invoice_date')
+                    ->form([
+                        DatePicker::make('created_from')->label('From Date'),
+                        DatePicker::make('created_until')->label('To Date'),
+                    ])
+                    ->query(function (Builder $query, array $data): Builder {
+                        return $query
+                            ->when($data['created_from'], fn (Builder $q, $date) => $q->whereDate('invoice_date', '>=', $date))
+                            ->when($data['created_until'], fn (Builder $q, $date) => $q->whereDate('invoice_date', '<=', $date));
+                    }),
+                
+                // 2. By Invoice Range (Sequence)
+                Filter::make('invoice_sequence')
+                    ->form([
+                        TextInput::make('seq_from')->numeric()->label('Start Sequence (e.g. 1)'),
+                        TextInput::make('seq_until')->numeric()->label('End Sequence (e.g. 50)'),
+                    ])
+                    ->query(function (Builder $query, array $data): Builder {
+                        return $query
+                            ->when($data['seq_from'], fn (Builder $q, $seq) => $q->where('invoice_sequence', '>=', $seq))
+                            ->when($data['seq_until'], fn (Builder $q, $seq) => $q->where('invoice_sequence', '<=', $seq));
+                    }),
+            ])
+            ->actions([
+                Tables\Actions\Action::make('download_pdf')
+                    ->label('Download PDF')
+                    ->icon('heroicon-o-document-arrow-down')
+                    ->color('success')
+                    ->action(function (Invoice $record) {
+                        return response()->streamDownload(function () use ($record) {
+                            echo self::generatePdf($record)->output();
+                        }, "{$record->invoice_number}.pdf");
+                    }),
+            ])
+            ->bulkActions([
+                Tables\Actions\BulkActionGroup::make([
+                    // 📦 ENTERPRISE BULK DOWNLOAD (Memory Safe + Collision Proof + Cleaned Up)
+                    Tables\Actions\BulkAction::make('export_zip')
+                        ->label('Export Selected as ZIP')
+                        ->icon('heroicon-o-archive-box-arrow-down')
+                        ->color('primary')
+                        ->requiresConfirmation()
+                        ->deselectRecordsAfterCompletion()
+                        ->action(function (\Illuminate\Database\Eloquent\Collection $records) {
+
+                            if ($records->isEmpty()) {
+                                return;
+                            }
+
+                            $timestamp = now()->format('Y_m_d_His');
+                            $random = Str::uuid();
+
+                            // Safer isolated temp paths (NOT exposed to the public symlink)
+                            $tempDir = storage_path("app/temp/invoices_{$timestamp}_{$random}");
+                            $zipPath = storage_path("app/temp/invoices_{$timestamp}_{$random}.zip");
+
+                            File::ensureDirectoryExists($tempDir);
+
+                            $zip = new ZipArchive();
+
+                            try {
+                                if ($zip->open($zipPath, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
+                                    throw new \Exception('Unable to create ZIP archive.');
+                                }
+
+                                foreach ($records as $invoice) {
+                                    $pdfFileName = "{$invoice->invoice_number}.pdf";
+                                    $pdfTempPath = "{$tempDir}/{$pdfFileName}";
+
+                                    // Generate PDF directly to disk
+                                    self::generatePdf($invoice)->save($pdfTempPath);
+
+                                    // Add physical file into zip
+                                    $zip->addFile($pdfTempPath, $pdfFileName);
+                                    
+                                    // Optional: Immediately release filesystem cache
+                                    clearstatcache(true, $pdfTempPath);
+                                }
+
+                                $zip->close();
+
+                                // Cleanup temp PDFs BEFORE response
+                                File::deleteDirectory($tempDir);
+
+                                return response()
+                                    ->download($zipPath)
+                                    ->deleteFileAfterSend(true);
+
+                            } catch (\Throwable $e) {
+                                // Ensure cleanup even on failure
+                                if (isset($zip)) {
+                                    @$zip->close();
+                                }
+
+                                File::deleteDirectory($tempDir);
+
+                                if (File::exists($zipPath)) {
+                                    File::delete($zipPath);
+                                }
+
+                                throw $e;
+                            }
+                        }),
+                ]),
+            ]);
+    }
+
+    // PDF Generator Helper
+    private static function generatePdf(Invoice $invoice)
+    {
+        $restaurant = $invoice->restaurant;
+
+        $brandName = $restaurant->name ?? 'Restaurant';
+        $gstIn = $invoice->gstin ?? ($restaurant->gst_no ?? 'N/A');
+        $pos = $invoice->place_of_supply ?? ($restaurant->address ?? 'N/A');
+        $phone = $restaurant->phone ?? '';
+
+        $itemsHtml = '';
+        foreach ($invoice->items_snapshot as $item) {
+            $hsn = isset($item['hsn_code']) && $item['hsn_code'] ? "<br><small style='color:gray;'>HSN: {$item['hsn_code']}</small>" : '';
+            $unitPriceFormatted = number_format((float) ($item['unit_price'] ?? 0), 2);
+            $totalFormatted = number_format((float) ($item['total'] ?? 0), 2);
+            $itemsHtml .= "<tr>
+                <td style='padding: 10px; border-bottom: 1px solid #ddd;'>{$item['name']} {$hsn}</td>
+                <td style='padding: 10px; border-bottom: 1px solid #ddd; text-align: center;'>{$item['qty']}</td>
+                <td style='padding: 10px; border-bottom: 1px solid #ddd; text-align: right;'>₹{$unitPriceFormatted}</td>
+                <td style='padding: 10px; border-bottom: 1px solid #ddd; text-align: right;'>₹{$totalFormatted}</td>
+            </tr>";
+        }
+
+        $taxable = max(0, (float) $invoice->subtotal - (float) $invoice->discount_amount);
+        $taxPercent = ($taxable > 0 && (float) $invoice->tax_amount > 0) ? round(((float) $invoice->tax_amount / $taxable) * 100, 1) : 0;
+        $halfTax = (float) $invoice->tax_amount / 2;
+        $halfPercent = round($taxPercent / 2, 2);
+
+        $breakdownRows = "
+            <tr>
+                <td style='padding: 8px; text-align: right;'><strong>Subtotal:</strong></td>
+                <td style='padding: 8px; text-align: right;'>₹" . number_format($invoice->subtotal, 2) . "</td>
+            </tr>";
+
+        if ((float) $invoice->discount_amount > 0) {
+            $breakdownRows .= "
+            <tr>
+                <td style='padding: 8px; text-align: right; color: #b91c1c;'><strong>Discount:</strong></td>
+                <td style='padding: 8px; text-align: right; color: #b91c1c;'>-₹" . number_format($invoice->discount_amount, 2) . "</td>
+            </tr>";
+        }
+
+        if ((float) $invoice->tax_amount > 0) {
+            $breakdownRows .= "
+            <tr>
+                <td style='padding: 8px; text-align: right;'><strong>CGST " . ($halfPercent > 0 ? "({$halfPercent}%)" : "") . ":</strong></td>
+                <td style='padding: 8px; text-align: right;'>₹" . number_format($halfTax, 2) . "</td>
+            </tr>
+            <tr>
+                <td style='padding: 8px; text-align: right;'><strong>SGST " . ($halfPercent > 0 ? "({$halfPercent}%)" : "") . ":</strong></td>
+                <td style='padding: 8px; text-align: right;'>₹" . number_format($halfTax, 2) . "</td>
+            </tr>
+            <tr>
+                <td style='padding: 8px; text-align: right;'><strong>Total Tax (GST " . ($taxPercent > 0 ? "{$taxPercent}%" : "") . "):</strong></td>
+                <td style='padding: 8px; text-align: right;'>₹" . number_format($invoice->tax_amount, 2) . "</td>
+            </tr>";
+        }
+
+        if ((float) $invoice->extra_charges > 0) {
+            $breakdownRows .= "
+            <tr>
+                <td style='padding: 8px; text-align: right;'><strong>Extra Charges:</strong></td>
+                <td style='padding: 8px; text-align: right;'>+₹" . number_format($invoice->extra_charges, 2) . "</td>
+            </tr>";
+        }
+
+        $breakdownRows .= "
+            <tr style='background: #f8f9fa; border-top: 2px solid #000; border-bottom: 2px solid #000;'>
+                <td style='padding: 12px; text-align: right; font-size: 18px;'><strong>GRAND TOTAL:</strong></td>
+                <td style='padding: 12px; text-align: right; font-size: 18px;'><strong>₹" . number_format($invoice->grand_total, 2) . "</strong></td>
+            </tr>";
+
+        $phoneHtml = $phone ? "<p style='margin: 3px 0 0 0; font-size: 13px;'>Phone: {$phone}</p>" : "";
+
+        $html = "
+            <div style='font-family: Arial, sans-serif; padding: 20px; color: #333;'>
+                <div style='text-align: center; border-bottom: 2px solid #000; padding-bottom: 20px; margin-bottom: 20px;'>
+                    <h1 style='margin: 0; font-size: 28px;'>{$brandName}</h1>
+                    <p style='margin: 5px 0 0 0;'>GSTIN: <strong>{$gstIn}</strong> | POS: {$pos}</p>
+                    {$phoneHtml}
+                    <h2 style='color: #555; margin-top: 15px;'>TAX INVOICE</h2>
+                </div>
+                
+                <table style='width: 100%; margin-bottom: 30px;'>
+                    <tr>
+                        <td style='width: 50%;'>
+                            <p><strong>Invoice No:</strong> {$invoice->invoice_number}</p>
+                            <p><strong>Ref Bill No:</strong> {$invoice->bill_number}</p> <!-- 🌟 NAYA: Showing Bill No on PDF -->
+                            <p><strong>Date:</strong> {$invoice->invoice_date->format('d M Y')}</p>
+                        </td>
+                        <td style='width: 50%; text-align: right;'>
+                            <p><strong>Billed To:</strong> {$invoice->customer_name}</p>
+                        </td>
+                    </tr>
+                </table>
+                
+                <table style='width: 100%; border-collapse: collapse; margin-top: 20px;'>
+                    <thead>
+                        <tr style='background: #f8f9fa; border-bottom: 2px solid #ddd;'>
+                            <th style='padding: 10px; text-align: left;'>Item Description</th>
+                            <th style='padding: 10px; text-align: center;'>Qty</th>
+                            <th style='padding: 10px; text-align: right;'>Rate</th>
+                            <th style='padding: 10px; text-align: right;'>Total</th>
+                        </tr>
+                    </thead>
+                    <tbody>{$itemsHtml}</tbody>
+                </table>
+                
+                <div style='width: 55%; float: right; margin-top: 30px;'>
+                    <table style='width: 100%; border-collapse: collapse;'>
+                        {$breakdownRows}
+                    </table>
+                </div>
+            </div>
+        ";
+
+        // 🚀 DOMPDF Optimizations for Performance & Security
+        return Pdf::loadHTML($html)
+            ->setPaper('a4')
+            ->setWarnings(false)
+            ->setOption([
+                'isHtml5ParserEnabled' => true,
+                'isRemoteEnabled' => false, // Disables external networks/images to prevent memory spikes
+            ]);
+    }
+
+    public static function getPages(): array
+    {
+        return [
+            'index' => Pages\ManageInvoices::route('/'),
+        ];
+    }
+}

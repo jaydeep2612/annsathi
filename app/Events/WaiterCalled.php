@@ -1,0 +1,58 @@
+<?php
+
+namespace App\Events;
+
+use Illuminate\Broadcasting\InteractsWithSockets;
+use Illuminate\Broadcasting\PrivateChannel;
+use Illuminate\Contracts\Broadcasting\ShouldBroadcastNow;
+use Illuminate\Foundation\Events\Dispatchable;
+use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Str;
+use App\Models\RestaurantTable; // 🔥 Import Model
+
+class WaiterCalled implements ShouldBroadcastNow
+{
+    use Dispatchable, InteractsWithSockets, SerializesModels;
+
+    public $restaurantId;
+    public $tableId;
+    public $tableNumber;
+    public $customerName;
+    public $eventId;
+    public $serviceType;
+
+    public function __construct($restaurantId, $tableId, $tableNumber, $customerName = 'Guest', $serviceType = 'dine_in')
+    {
+        $this->restaurantId = $restaurantId;
+        $this->tableId = $tableId;
+        $this->tableNumber = $tableNumber;
+        $this->customerName = $customerName;
+        $this->serviceType = $serviceType;
+        $this->eventId = Str::uuid()->toString();
+    }
+
+    public function broadcastOn(): array
+    {
+        return [
+            new PrivateChannel('restaurant.' . $this->restaurantId . '.alerts'),
+        ];
+    }
+
+    public function broadcastAs(): string
+    {
+        return 'WaiterCalled';
+    }
+
+    public function broadcastWith(): array
+    {
+        return [
+            'restaurant_id' => $this->restaurantId,
+            'table_id' => $this->tableId,
+            'table_number' => $this->tableNumber,
+            'customer_name' => $this->customerName,
+            'service_type' => $this->serviceType,
+            'event_id' => $this->eventId,
+            'timestamp' => now()->timestamp,
+        ];
+    }
+}
